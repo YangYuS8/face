@@ -10,6 +10,8 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 from sklearn.metrics import classification_report, accuracy_score
+from torch.utils.tensorboard import SummaryWriter
+from typing import Optional
 
 from .data import build_dataloaders
 from .models import create_model
@@ -33,6 +35,11 @@ class TrainConfig:
     out_dir: str = "./outputs"
     patience: int = 7
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    log_tb: bool = True
+    tb_dir: Optional[str] = None
+    log_wandb: bool = False
+    project: str = "fer-baseline"
+    run_name: Optional[str] = None
 
 
 class EarlyStopper:
@@ -102,6 +109,16 @@ def evaluate(model, loader, criterion, device):
 
 def fit(cfg: TrainConfig):
     os.makedirs(cfg.out_dir, exist_ok=True)
+    tb_dir = cfg.tb_dir or os.path.join(cfg.out_dir, "tb")
+    writer: Optional[SummaryWriter] = SummaryWriter(log_dir=tb_dir) if cfg.log_tb else None
+
+    # Optional: Weights & Biases
+    if cfg.log_wandb:
+        try:
+            import wandb  # type: ignore[import-not-found]
+            wandb.init(project=cfg.project, name=cfg.run_name, config=asdict(cfg))
+        except Exception as e:
+            print(f"W&B init failed: {e}")
     train_loader, val_loader, test_loader, num_classes, class_names = build_dataloaders(
         cfg.data_root,
         img_size=cfg.img_size,
@@ -143,6 +160,18 @@ def fit(cfg: TrainConfig):
 
         print(f"Epoch {epoch}/{cfg.epochs} - train_loss: {train_loss:.4f} val_loss: {val_loss:.4f} val_acc: {val_acc:.4f}")
 
+        # Log scalars
+        if writer is not None:
+            writer.add_scalar("loss/train", train_loss, epoch)
+            writer.add_scalar("loss/val", val_loss, epoch)
+            writer.add_scalar("metrics/val_acc", val_acc, epoch)
+        if cfg.log_wandb:
+            try:
+                import wandb  # type: ignore[import-not-found]
+                wandb.log({"train_loss": train_loss, "val_loss": val_loss, "val_acc": val_acc, "epoch": epoch})
+            except Exception:
+                pass
+
         # Save best
         if val_acc > best_acc:
             best_acc = val_acc
@@ -175,6 +204,17 @@ def fit(cfg: TrainConfig):
             json.dump(test_result, f, indent=2, ensure_ascii=False)
         print(f"Test - loss: {test_loss:.4f} acc: {test_acc:.4f}")
 
+    # Close loggers
+    if writer is not None:
+        writer.flush()
+        writer.close()
+    if cfg.log_wandb:
+        try:
+            import wandb  # type: ignore[import-not-found]
+            wandb.finish()
+        except Exception:
+            pass
+
     return best_path, history, test_result
 
 
@@ -195,6 +235,11 @@ if __name__ == "__main__":
     p.add_argument("--test_split", type=float, default=0.0)
     p.add_argument("--no_amp", action="store_true", help="Disable mixed precision")
     p.add_argument("--out_dir", type=str, default="./outputs")
+    p.add_argument("--no_tb", action="store_true", help="Disable TensorBoard logging")
+    p.add_argument("--tb_dir", type=str, default=None, help="TensorBoard log dir (default outputs/tb)")
+    p.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
+    p.add_argument("--project", type=str, default="fer-baseline")
+    p.add_argument("--run_name", type=str, default=None)
     args = p.parse_args()
 
     cfg = TrainConfig(
@@ -212,6 +257,11 @@ if __name__ == "__main__":
         test_split=args.test_split,
         mix_precision=not args.no_amp,
         out_dir=args.out_dir,
+        log_tb=not args.no_tb,
+        tb_dir=args.tb_dir,
+        log_wandb=args.wandb,
+        project=args.project,
+        run_name=args.run_name,
     )
 
     fit(cfg)
