@@ -10,7 +10,16 @@ from .data import build_dataloaders
 from .models import create_model
 
 
-def evaluate_checkpoint(ckpt_path: str, data_root: str, img_size: int = 224, batch_size: int = 64, num_workers: int = 4):
+def evaluate_checkpoint(
+    ckpt_path: str,
+    data_root: str,
+    img_size: int = 224,
+    batch_size: int = 64,
+    num_workers: int = 4,
+    val_split: float = 0.0,
+    test_split: float = 0.0,
+    split: str = "auto",  # 'val' | 'test' | 'auto'
+):
     ckpt = torch.load(ckpt_path, map_location="cpu")
     num_classes = ckpt["num_classes"]
     class_names = ckpt["class_names"]
@@ -25,8 +34,8 @@ def evaluate_checkpoint(ckpt_path: str, data_root: str, img_size: int = 224, bat
         img_size=img_size,
         batch_size=batch_size,
         num_workers=num_workers,
-        val_split=0.0,  # assume val exists or use test
-        test_split=0.0,
+        val_split=val_split,
+        test_split=test_split,
         augment=False,
     )
 
@@ -48,10 +57,26 @@ def evaluate_checkpoint(ckpt_path: str, data_root: str, img_size: int = 224, bat
                 y_pred.extend(pred.cpu().tolist())
         return loss_sum / len(loader.dataset), y_true, y_pred
 
-    if test_loader is not None:
+    # Choose split according to preference
+    if split == "test" and test_loader is not None:
         loader = test_loader
-    else:
+    elif split == "val" and val_loader is not None:
         loader = val_loader
+    else:
+        loader = test_loader if test_loader is not None else val_loader
+
+    if loader is None:
+        raise RuntimeError(
+            "No evaluation data found. Ensure your DATA_ROOT has 'val/' or 'test/' or provide --val_split/--test_split > 0 when using a single-folder dataset."
+        )
+    try:
+        ds_len = len(loader.dataset)  # type: ignore[arg-type]
+    except Exception:
+        ds_len = 0
+    if ds_len == 0:
+        raise RuntimeError(
+            "Empty evaluation dataset. Please verify your folders or split ratios."
+        )
 
     loss, y_true, y_pred = _eval(loader)
     acc = accuracy_score(y_true, y_pred)
@@ -69,6 +94,18 @@ if __name__ == "__main__":
     p.add_argument("--img_size", type=int, default=224)
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--val_split", type=float, default=0.0, help="If your dataset has no val/ folder, set a >0 ratio to split from a single-folder root (seed=42)")
+    p.add_argument("--test_split", type=float, default=0.0, help="If you want a held-out test from a single-folder root")
+    p.add_argument("--split", type=str, default="auto", choices=["auto", "val", "test"], help="Which split to evaluate")
     args = p.parse_args()
 
-    evaluate_checkpoint(args.ckpt, args.data_root, args.img_size, args.batch_size, args.num_workers)
+    evaluate_checkpoint(
+        args.ckpt,
+        args.data_root,
+        args.img_size,
+        args.batch_size,
+        args.num_workers,
+        args.val_split,
+        args.test_split,
+        args.split,
+    )

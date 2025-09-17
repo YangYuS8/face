@@ -1,5 +1,5 @@
 import os
-from typing import Tuple, Optional, Dict, Sequence
+from typing import Tuple, Optional, Dict, Sequence, cast
 
 import torch
 from torch.utils.data import DataLoader, random_split
@@ -84,10 +84,42 @@ def build_dataloaders(
 
     paths = _infer_structure(data_root)
 
-    if paths["train"] and paths["val"]:
-        train_ds = datasets.ImageFolder(paths["train"], transform=train_tf)
-        val_ds = datasets.ImageFolder(paths["val"], transform=val_tf)
-        test_ds = datasets.ImageFolder(paths["test"], transform=val_tf) if paths["test"] else None
+    has_train = paths["train"] is not None
+    has_val = paths["val"] is not None
+    has_test = paths["test"] is not None
+
+    if has_train and has_val:
+        train_root = cast(str, paths["train"])
+        val_root = cast(str, paths["val"])
+        train_ds = datasets.ImageFolder(train_root, transform=train_tf)
+        val_ds = datasets.ImageFolder(val_root, transform=val_tf)
+        test_ds = datasets.ImageFolder(cast(str, paths["test"]), transform=val_tf) if has_test else None
+    elif has_train and (not has_val) and has_test:
+        # Case: train/ and test/ exist, but no val/
+        train_root = cast(str, paths["train"])
+        test_root = cast(str, paths["test"])
+        if val_split and val_split > 0:
+            # Split val from train, keep official test as test
+            base_eval_ds = datasets.ImageFolder(train_root, transform=val_tf)
+            n_total = len(base_eval_ds)
+            n_val = int(n_total * val_split)
+            n_train = n_total - n_val
+            g = torch.Generator().manual_seed(42)
+            perm = torch.randperm(n_total, generator=g).tolist()
+            train_idx: Sequence[int] = perm[:n_train]
+            val_idx: Sequence[int] = perm[n_train:n_train + n_val]
+
+            train_base_ds = datasets.ImageFolder(train_root, transform=train_tf)
+            val_base_ds = base_eval_ds
+            from torch.utils.data import Subset
+            train_ds = Subset(train_base_ds, train_idx)
+            val_ds = Subset(val_base_ds, val_idx)
+            test_ds = datasets.ImageFolder(test_root, transform=val_tf)
+        else:
+            # No val split requested: use test as validation to enable training/eval loops
+            train_ds = datasets.ImageFolder(train_root, transform=train_tf)
+            val_ds = datasets.ImageFolder(test_root, transform=val_tf)
+            test_ds = datasets.ImageFolder(test_root, transform=val_tf)
     else:
         # Single folder -> split on indices; use distinct datasets per split to apply different transforms
         root = paths["train"] or data_root
