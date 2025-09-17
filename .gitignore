@@ -42,6 +42,7 @@ logs/
 
 # Artifacts & outputs
 outputs/
+outputs*/
 runs/
 checkpoints/
 wandb/
