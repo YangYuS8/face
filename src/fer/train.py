@@ -41,6 +41,13 @@ class TrainConfig:
     log_wandb: bool = False
     project: str = "fer-baseline"
     run_name: Optional[str] = None
+    label_smoothing: float = 0.0
+    random_erasing: float = 0.0
+    auto_augment: bool = False
+    loss_type: str = "ce"  # "ce" | "focal"
+    focal_gamma: float = 2.0
+    mixup: float = 0.0
+    cutmix: float = 0.0
 
 
 class EarlyStopper:
@@ -66,13 +73,33 @@ class EarlyStopper:
         return self.should_stop
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device, scaler: Optional[GradScaler], mix_precision: bool):
+_WARNED_CUTMIX = False
+
+
+def train_one_epoch(model, loader, criterion, optimizer, device, scaler: Optional[GradScaler], mix_precision: bool, mixup_alpha: float = 0.0, cutmix_alpha: float = 0.0):
     model.train()
     running_loss = 0.0
     for images, labels in tqdm(loader, desc="train", leave=False):
         images = images.to(device)
         labels = labels.to(device)
         optimizer.zero_grad(set_to_none=True)
+        # Prepare MixUp (CutMix not implemented; warn once if requested)
+        mix_applied = False
+        lam = 1.0
+        if cutmix_alpha and cutmix_alpha > 0:
+            global _WARNED_CUTMIX
+            if not _WARNED_CUTMIX:
+                print("[warn] CutMix 未实现，已忽略该参数。")
+                _WARNED_CUTMIX = True
+        if mixup_alpha and mixup_alpha > 0:
+            mix_applied = True
+            lam = torch.distributions.Beta(mixup_alpha, mixup_alpha).sample().item()
+            index = torch.randperm(images.size(0), device=device)
+            mixed_images = lam * images + (1 - lam) * images[index, :]
+            labels_a, labels_b = labels, labels[index]
+        else:
+            mixed_images = images
+            labels_a = labels_b = labels
         if mix_precision and scaler is not None:
             # Compatibility: prefer torch.amp.autocast, fallback to torch.cuda.amp.autocast
             try:
@@ -87,14 +114,20 @@ def train_one_epoch(model, loader, criterion, optimizer, device, scaler: Optiona
                 from torch.cuda.amp import autocast as legacy_autocast  # type: ignore
                 ac = legacy_autocast()
             with ac:
-                outputs = model(images)
-                loss = criterion(outputs, labels)
+                outputs = model(mixed_images)
+                if mix_applied:
+                    loss = lam * criterion(outputs, labels_a) + (1 - lam) * criterion(outputs, labels_b)
+                else:
+                    loss = criterion(outputs, labels)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
         else:
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+            outputs = model(mixed_images)
+            if mix_applied:
+                loss = lam * criterion(outputs, labels_a) + (1 - lam) * criterion(outputs, labels_b)
+            else:
+                loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
         running_loss += loss.item() * images.size(0)
@@ -140,12 +173,42 @@ def fit(cfg: TrainConfig):
         val_split=cfg.val_split,
         test_split=cfg.test_split,
         augment=True,
+        auto_augment=cfg.auto_augment,
+        random_erasing=cfg.random_erasing,
     )
 
     model = create_model(num_classes=num_classes, backbone=cfg.backbone, pretrained=cfg.pretrained, dropout=cfg.dropout)
     model.to(cfg.device)
 
-    criterion = nn.CrossEntropyLoss()
+    # Optional class weights can be computed here if needed
+    criterion: nn.Module
+    if cfg.loss_type == "focal":
+        class FocalLoss(nn.Module):
+            def __init__(self, gamma: float = 2.0, smoothing: float = 0.0):
+                super().__init__()
+                self.gamma = gamma
+                self.smoothing = smoothing
+            def forward(self, logits, target):
+                if self.smoothing > 0:
+                    # label smoothing CE
+                    num_classes = logits.size(1)
+                    with torch.no_grad():
+                        true_dist = torch.zeros_like(logits)
+                        true_dist.fill_(self.smoothing / (num_classes - 1))
+                        true_dist.scatter_(1, target.unsqueeze(1), 1 - self.smoothing)
+                    log_prob = torch.log_softmax(logits, dim=1)
+                    ce = -(true_dist * log_prob).sum(dim=1)
+                else:
+                    ce = nn.functional.cross_entropy(logits, target, reduction='none')
+                pt = torch.softmax(logits, dim=1).gather(1, target.unsqueeze(1)).squeeze(1)
+                loss = ((1 - pt) ** self.gamma) * ce
+                return loss.mean()
+        criterion = FocalLoss(gamma=cfg.focal_gamma, smoothing=cfg.label_smoothing)
+    else:
+        if cfg.label_smoothing > 0:
+            criterion = nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
+        else:
+            criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=cfg.epochs)
     scaler = GradScaler(enabled=cfg.mix_precision)
@@ -158,7 +221,10 @@ def fit(cfg: TrainConfig):
     history = []
 
     for epoch in range(1, cfg.epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, cfg.device, scaler, cfg.mix_precision)
+        train_loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, cfg.device, scaler, cfg.mix_precision,
+            mixup_alpha=cfg.mixup, cutmix_alpha=cfg.cutmix,
+        )
         val_loss, val_acc, y_true, y_pred = evaluate(model, val_loader, criterion, cfg.device)
         scheduler.step()
 
@@ -241,7 +307,7 @@ if __name__ == "__main__":
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight_decay", type=float, default=1e-4)
-    p.add_argument("--backbone", type=str, default="resnet18", choices=["resnet18", "resnet50"])
+    p.add_argument("--backbone", type=str, default="resnet18")
     p.add_argument("--pretrained", action="store_true")
     p.add_argument("--dropout", type=float, default=0.2)
     p.add_argument("--val_split", type=float, default=0.1)
@@ -253,6 +319,14 @@ if __name__ == "__main__":
     p.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     p.add_argument("--project", type=str, default="fer-baseline")
     p.add_argument("--run_name", type=str, default=None)
+    # Regularization & losses
+    p.add_argument("--label_smoothing", type=float, default=0.0)
+    p.add_argument("--random_erasing", type=float, default=0.0)
+    p.add_argument("--auto_augment", action="store_true")
+    p.add_argument("--loss_type", type=str, default="ce", choices=["ce", "focal"])
+    p.add_argument("--focal_gamma", type=float, default=2.0)
+    p.add_argument("--mixup", type=float, default=0.0)
+    p.add_argument("--cutmix", type=float, default=0.0)
     args = p.parse_args()
 
     cfg = TrainConfig(
@@ -275,6 +349,13 @@ if __name__ == "__main__":
         log_wandb=args.wandb,
         project=args.project,
         run_name=args.run_name,
+        label_smoothing=args.label_smoothing,
+        random_erasing=args.random_erasing,
+        auto_augment=args.auto_augment,
+        loss_type=args.loss_type,
+        focal_gamma=args.focal_gamma,
+        mixup=args.mixup,
+        cutmix=args.cutmix,
     )
 
     fit(cfg)

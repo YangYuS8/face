@@ -73,7 +73,7 @@ python -m src.fer.train \
   --pretrained \
   --epochs 30 \
   --batch_size 64 \
-  --backbone resnet18  # 或 resnet50
+  --backbone resnet18  # 或 resnet50，或任意 timm 名称（如 convnext_tiny、vit_base_patch16_224、swin_tiny_patch4_window7_224）
 
 kaggle datasets download -d msambare/fer2013 -p data/fer2013
 unzip -q data/fer2013/fer2013.zip -d data/fer2013
@@ -103,9 +103,15 @@ python -m src.fer.train \
   --val_split 0.1
 ```
 
-可选参数：`--img_size 224 --lr 3e-4 --weight_decay 1e-4 --val_split 0.1 --test_split 0.0 --no_amp --out_dir ./outputs`。
+可选参数：
+`--img_size 224 --lr 3e-4 --weight_decay 1e-4 --val_split 0.1 --test_split 0.0 --no_amp --out_dir ./outputs`，
+增强/正则化相关：
+`--auto_augment`（启用 AutoAugment）、`--random_erasing 0.25`、
+损失相关：`--loss_type ce|focal`、`--label_smoothing 0.1`、`--focal_gamma 2.0`、
+混合增强：`--mixup 0.2`（CutMix 参数 `--cutmix` 暂未实现，将被忽略）。
 
 训练中会保存 `best.pt`（基于验证集准确率），以及 `history.json`。
+若使用 timm 模型，请先安装：`pip install timm`。
 
 ## 4. 评估
 

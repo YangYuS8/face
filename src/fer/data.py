@@ -14,24 +14,37 @@ DEFAULT_MEAN_STD = {
 }
 
 
-def _build_transforms(img_size: int = 224, augment: bool = True):
+def _build_transforms(
+    img_size: int = 224,
+    augment: bool = True,
+    auto_augment: bool = False,
+    random_erasing: float = 0.0,
+):
     mean = DEFAULT_MEAN_STD.get(img_size, DEFAULT_MEAN_STD[224])["mean"]
     std = DEFAULT_MEAN_STD.get(img_size, DEFAULT_MEAN_STD[224])["std"]
 
-    train_tf = [
-        transforms.Resize((img_size, img_size)),
-    ]
+    train_tf = []  # type: ignore[var-annotated]
     if augment:
-        train_tf = [
+        train_tf.extend([
             transforms.Resize(int(img_size * 1.1)),
             transforms.RandomResizedCrop(img_size, scale=(0.6, 1.0), ratio=(0.9, 1.1)),
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.ColorJitter(brightness=0.2, contrast=0.2),
-        ]
-    train_tf += [
+        ])
+        if auto_augment:
+            try:
+                train_tf.append(transforms.AutoAugment(transforms.AutoAugmentPolicy.IMAGENET))
+            except Exception:
+                # Fallback: light RandAugment-like jitter if AutoAugment unavailable
+                train_tf.append(transforms.RandomAdjustSharpness(1.5, p=0.5))
+    else:
+        train_tf.append(transforms.Resize((img_size, img_size)))
+    train_tf.extend([
         transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std),
-    ]
+    ])
+    if random_erasing and random_erasing > 0:
+        train_tf.append(transforms.RandomErasing(p=float(random_erasing)))
 
     val_tf = transforms.Compose([
         transforms.Resize((img_size, img_size)),
@@ -72,6 +85,8 @@ def build_dataloaders(
     val_split: float = 0.1,
     test_split: float = 0.0,
     augment: bool = True,
+    auto_augment: bool = False,
+    random_erasing: float = 0.0,
 ) -> Tuple[DataLoader, DataLoader, Optional[DataLoader], int, Tuple[str, ...]]:
     """
     Returns train_loader, val_loader, test_loader (optional), num_classes, class_names
@@ -80,7 +95,7 @@ def build_dataloaders(
       - data_root/<class>/* (auto split train/val[/test])
     """
     assert os.path.isdir(data_root), f"data_root not found: {data_root}"
-    train_tf, val_tf = _build_transforms(img_size, augment)
+    train_tf, val_tf = _build_transforms(img_size, augment, auto_augment=auto_augment, random_erasing=random_erasing)
 
     paths = _infer_structure(data_root)
 

@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -25,4 +25,28 @@ class FERResNet(nn.Module):
 
 
 def create_model(num_classes: int, backbone: str = "resnet18", pretrained: bool = True, dropout: float = 0.2) -> nn.Module:
-    return FERResNet(num_classes=num_classes, backbone=backbone, pretrained=pretrained, dropout=dropout)
+    # Native torchvision backbones
+    if backbone in {"resnet18", "resnet50"}:
+        return FERResNet(num_classes=num_classes, backbone=backbone, pretrained=pretrained, dropout=dropout)
+
+    # Try timm backbones
+    try:
+        import timm  # type: ignore
+    except Exception as e:
+        raise ValueError(f"Backbone '{backbone}' requires timm. Please install timm to use this model. ({e})")
+
+    # Many timm models accept num_classes directly
+    try:
+        model = timm.create_model(backbone, pretrained=pretrained, num_classes=num_classes)
+        return model
+    except Exception as e:
+        # Fallback: create with features head, then attach classifier
+        model = timm.create_model(backbone, pretrained=pretrained, num_classes=0)
+        in_feats = model.num_features if hasattr(model, 'num_features') else None
+        if in_feats is None:
+            raise
+        classifier = nn.Linear(in_feats, num_classes)
+        model.reset_classifier(num_classes) if hasattr(model, 'reset_classifier') else None
+        # Attach a generic classifier head
+        model.fc = classifier  # type: ignore[attr-defined]
+        return model
