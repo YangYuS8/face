@@ -2,12 +2,13 @@ import os
 import json
 from dataclasses import dataclass, asdict
 from typing import Optional
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
 from tqdm import tqdm
 from sklearn.metrics import classification_report, accuracy_score
 from torch.utils.tensorboard import SummaryWriter
@@ -73,7 +74,19 @@ def train_one_epoch(model, loader, criterion, optimizer, device, scaler: Optiona
         labels = labels.to(device)
         optimizer.zero_grad(set_to_none=True)
         if mix_precision and scaler is not None:
-            with autocast():
+            # Compatibility: prefer torch.amp.autocast, fallback to torch.cuda.amp.autocast
+            try:
+                # Prefer torch.amp.autocast API if available
+                amp_module = getattr(torch, "amp", None)
+                autocast_fn = getattr(amp_module, "autocast", None) if amp_module is not None else None
+                if autocast_fn is not None:
+                    ac = autocast_fn(device_type=("cuda" if str(device).startswith("cuda") else "cpu"))
+                else:
+                    raise AttributeError("torch.amp.autocast not available")
+            except Exception:
+                from torch.cuda.amp import autocast as legacy_autocast  # type: ignore
+                ac = legacy_autocast()
+            with ac:
                 outputs = model(images)
                 loss = criterion(outputs, labels)
             scaler.scale(loss).backward()
