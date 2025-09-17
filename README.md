@@ -7,6 +7,7 @@
 项目支持两种目录结构：
 
 1) 已分好集：
+
 ```
 DATA_ROOT/
   train/
@@ -20,15 +21,18 @@ DATA_ROOT/
 ```
 
 2) 单一目录（自动划分 train/val[/test]）
+
 ```
 DATA_ROOT/
   happy/
   sad/
   ...
 ```
+
 通过 `--val_split`、`--test_split` 控制比例（默认 0.1/0.0）。
 
 推荐公共数据集：
+
 - RAF-DB（7 类）
 - FER+（8 类）
 - AffectNet（更大更难，需授权）
@@ -55,6 +59,16 @@ python -m src.fer.train \
   --epochs 30 \
   --batch_size 64 \
   --backbone resnet18  # 或 resnet50
+
+kaggle datasets download -d msambare/fer2013 -p data/fer2013
+unzip -q data/fer2013/fer2013.zip -d data/fer2013
+
+python -m src.fer.train \
+  --data_root data/fer2013 \
+  --pretrained \
+  --epochs 30 \
+  --batch_size 64 \
+  --val_split 0.1
 ```
 
 可选参数：`--img_size 224 --lr 3e-4 --weight_decay 1e-4 --val_split 0.1 --test_split 0.0 --no_amp --out_dir ./outputs`。
