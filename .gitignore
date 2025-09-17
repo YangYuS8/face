@@ -1,0 +1,70 @@
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Build and packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.python-version
+
+# IDE/editor
+.vscode/
+.idea/
+*.code-workspace
+
+# Testing/coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# Type checker caches
+.mypy_cache/
+.pytype/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+logs/
+*.log
+
+# Artifacts & outputs
+outputs/
+runs/
+checkpoints/
+wandb/
+.mlflow/
+
+# Datasets (optional: keep large data out of git)
+data/
+datasets/
+
+# Model files
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+*.trt
+
+# Caches and temp
+.cache/
+*.cache
+*.tmp
+/tmp/
+
+# OS files
+.DS_Store
+Thumbs.db
