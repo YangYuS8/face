@@ -41,7 +41,7 @@ def evaluate_checkpoint(
 
     criterion = nn.CrossEntropyLoss()
 
-    def _eval(loader):
+    def _eval(loader, tta: bool = False):
         model.eval()
         loss_sum = 0.0
         y_true, y_pred = [], []
@@ -50,6 +50,9 @@ def evaluate_checkpoint(
                 images = images.to(device)
                 labels = labels.to(device)
                 outputs = model(images)
+                if tta:
+                    outputs_flipped = model(torch.flip(images, dims=[3]))
+                    outputs = (outputs + outputs_flipped) / 2.0
                 loss = criterion(outputs, labels)
                 loss_sum += loss.item() * images.size(0)
                 pred = outputs.argmax(dim=1)
@@ -78,7 +81,7 @@ def evaluate_checkpoint(
             "Empty evaluation dataset. Please verify your folders or split ratios."
         )
 
-    loss, y_true, y_pred = _eval(loader)
+    loss, y_true, y_pred = _eval(loader, tta=args.tta)
     acc = accuracy_score(y_true, y_pred)
     report = classification_report(y_true, y_pred, target_names=list(class_names), zero_division=0)
 
@@ -97,6 +100,7 @@ if __name__ == "__main__":
     p.add_argument("--val_split", type=float, default=0.0, help="If your dataset has no val/ folder, set a >0 ratio to split from a single-folder root (seed=42)")
     p.add_argument("--test_split", type=float, default=0.0, help="If you want a held-out test from a single-folder root")
     p.add_argument("--split", type=str, default="auto", choices=["auto", "val", "test"], help="Which split to evaluate")
+    p.add_argument("--tta", action="store_true", help="Enable simple TTA (horizontal flip)")
     args = p.parse_args()
 
     evaluate_checkpoint(
