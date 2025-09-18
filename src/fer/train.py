@@ -8,7 +8,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR, SequentialLR, LinearLR
-from torch.cuda.amp import GradScaler
+try:
+    from torch.amp import GradScaler  # type: ignore
+except Exception:
+    from torch.cuda.amp import GradScaler  # type: ignore
 from tqdm import tqdm
 from sklearn.metrics import classification_report, accuracy_score
 from torch.utils.tensorboard import SummaryWriter
@@ -53,6 +56,7 @@ class TrainConfig:
     warmup_epochs: int = 0
     ema: bool = False
     ema_decay: float = 0.999
+    grad_clip: float = 0.0
 
 
 class EarlyStopper:
@@ -84,7 +88,7 @@ class EarlyStopper:
 _WARNED_CUTMIX = False
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device, scaler: Optional[GradScaler], mix_precision: bool, mixup_alpha: float = 0.0, cutmix_alpha: float = 0.0, grad_accum_steps: int = 1):
+def train_one_epoch(model, loader, criterion, optimizer, device, scaler: Optional[GradScaler], mix_precision: bool, mixup_alpha: float = 0.0, cutmix_alpha: float = 0.0, grad_accum_steps: int = 1, grad_clip: float = 0.0, ema_state: Optional[dict] = None, ema_decay: float = 0.999):
     model.train()
     running_loss = 0.0
     for step, (images, labels) in enumerate(tqdm(loader, desc="train", leave=False), start=1):
@@ -132,9 +136,17 @@ def train_one_epoch(model, loader, criterion, optimizer, device, scaler: Optiona
             loss = loss / max(1, grad_accum_steps)
             scaler.scale(loss).backward()
             if (step % max(1, grad_accum_steps) == 0) or (step == len(loader)):
+                if grad_clip and grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+                # Per-step EMA update after optimizer step
+                if ema_state is not None:
+                    for k, v in model.state_dict().items():
+                        if k in ema_state:
+                            ema_state[k].mul_(ema_decay).add_(v.detach(), alpha=(1.0 - ema_decay))
         else:
             outputs = model(mixed_images)
             if mix_applied:
@@ -145,8 +157,14 @@ def train_one_epoch(model, loader, criterion, optimizer, device, scaler: Optiona
             loss = loss / max(1, grad_accum_steps)
             loss.backward()
             if (step % max(1, grad_accum_steps) == 0) or (step == len(loader)):
+                if grad_clip and grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                if ema_state is not None:
+                    for k, v in model.state_dict().items():
+                        if k in ema_state:
+                            ema_state[k].mul_(ema_decay).add_(v.detach(), alpha=(1.0 - ema_decay))
         running_loss += loss_value * images.size(0)
     return running_loss / len(loader.dataset)
 
@@ -264,6 +282,7 @@ def fit(cfg: TrainConfig):
         train_loss = train_one_epoch(
             model, train_loader, criterion, optimizer, cfg.device, scaler, cfg.mix_precision,
             mixup_alpha=cfg.mixup, cutmix_alpha=cfg.cutmix, grad_accum_steps=cfg.grad_accum_steps,
+            grad_clip=cfg.grad_clip, ema_state=ema_state if cfg.ema else None, ema_decay=cfg.ema_decay,
         )
         # Evaluate current model; if EMA enabled also evaluate EMA snapshot
         val_loss, val_acc, y_true, y_pred = evaluate(model, val_loader, criterion, cfg.device)
@@ -292,13 +311,15 @@ def fit(cfg: TrainConfig):
             "report": report,
         })
 
-        print(f"Epoch {epoch}/{cfg.epochs} - train_loss: {train_loss:.4f} val_loss: {val_loss:.4f} val_acc: {val_acc:.4f}")
+        current_lr = optimizer.param_groups[0].get('lr', 0.0)
+        print(f"Epoch {epoch}/{cfg.epochs} - lr: {current_lr:.6f} train_loss: {train_loss:.4f} val_loss: {val_loss:.4f} val_acc: {val_acc:.4f}")
 
         # Log scalars
         if writer is not None:
             writer.add_scalar("loss/train", train_loss, epoch)
             writer.add_scalar("loss/val", val_loss, epoch)
             writer.add_scalar("metrics/val_acc", val_acc, epoch)
+            writer.add_scalar("lr", current_lr, epoch)
         if cfg.log_wandb:
             try:
                 import wandb  # type: ignore[import-not-found]
@@ -391,6 +412,7 @@ if __name__ == "__main__":
     p.add_argument("--grad_checkpointing", action="store_true", help="启用梯度检查点（timm 模型通常支持）")
     p.add_argument("--ema", action="store_true", help="启用模型 EMA 以提升泛化")
     p.add_argument("--ema_decay", type=float, default=0.999, help="EMA 衰减系数，接近 1 更平滑")
+    p.add_argument("--grad_clip", type=float, default=0.0, help="梯度裁剪阈值 (global norm)")
     args = p.parse_args()
 
     cfg = TrainConfig(
@@ -399,8 +421,8 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         epochs=args.epochs,
-    patience=args.patience,
-    warmup_epochs=args.warmup_epochs,
+        patience=args.patience,
+        warmup_epochs=args.warmup_epochs,
         lr=args.lr,
         weight_decay=args.weight_decay,
         backbone=args.backbone,
@@ -426,6 +448,7 @@ if __name__ == "__main__":
         grad_checkpointing=args.grad_checkpointing,
         ema=args.ema,
         ema_decay=args.ema_decay,
+        grad_clip=args.grad_clip,
     )
 
     fit(cfg)
