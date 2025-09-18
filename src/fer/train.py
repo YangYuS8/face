@@ -48,6 +48,8 @@ class TrainConfig:
     focal_gamma: float = 2.0
     mixup: float = 0.0
     cutmix: float = 0.0
+    grad_accum_steps: int = 1
+    grad_checkpointing: bool = False
 
 
 class EarlyStopper:
@@ -67,6 +69,9 @@ class EarlyStopper:
             self.best = value
             self.counter = 0
         else:
+            # patience <= 0 means disable early stopping
+            if self.patience <= 0:
+                return False
             self.counter += 1
             if self.counter >= self.patience:
                 self.should_stop = True
@@ -76,13 +81,14 @@ class EarlyStopper:
 _WARNED_CUTMIX = False
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device, scaler: Optional[GradScaler], mix_precision: bool, mixup_alpha: float = 0.0, cutmix_alpha: float = 0.0):
+def train_one_epoch(model, loader, criterion, optimizer, device, scaler: Optional[GradScaler], mix_precision: bool, mixup_alpha: float = 0.0, cutmix_alpha: float = 0.0, grad_accum_steps: int = 1):
     model.train()
     running_loss = 0.0
-    for images, labels in tqdm(loader, desc="train", leave=False):
+    for step, (images, labels) in enumerate(tqdm(loader, desc="train", leave=False), start=1):
         images = images.to(device)
         labels = labels.to(device)
-        optimizer.zero_grad(set_to_none=True)
+        if step == 1:
+            optimizer.zero_grad(set_to_none=True)
         # Prepare MixUp (CutMix not implemented; warn once if requested)
         mix_applied = False
         lam = 1.0
@@ -119,18 +125,26 @@ def train_one_epoch(model, loader, criterion, optimizer, device, scaler: Optiona
                     loss = lam * criterion(outputs, labels_a) + (1 - lam) * criterion(outputs, labels_b)
                 else:
                     loss = criterion(outputs, labels)
+            loss_value = loss.item()
+            loss = loss / max(1, grad_accum_steps)
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            if (step % max(1, grad_accum_steps) == 0) or (step == len(loader)):
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
         else:
             outputs = model(mixed_images)
             if mix_applied:
                 loss = lam * criterion(outputs, labels_a) + (1 - lam) * criterion(outputs, labels_b)
             else:
                 loss = criterion(outputs, labels)
+            loss_value = loss.item()
+            loss = loss / max(1, grad_accum_steps)
             loss.backward()
-            optimizer.step()
-        running_loss += loss.item() * images.size(0)
+            if (step % max(1, grad_accum_steps) == 0) or (step == len(loader)):
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+        running_loss += loss_value * images.size(0)
     return running_loss / len(loader.dataset)
 
 
@@ -179,6 +193,14 @@ def fit(cfg: TrainConfig):
 
     model = create_model(num_classes=num_classes, backbone=cfg.backbone, pretrained=cfg.pretrained, dropout=cfg.dropout)
     model.to(cfg.device)
+    # Optional gradient checkpointing (timm models usually support)
+    if cfg.grad_checkpointing:
+        try:
+            if hasattr(model, "set_grad_checkpointing"):
+                model.set_grad_checkpointing(True)  # type: ignore[attr-defined]
+                print("[info] 已启用梯度检查点 (Grad Checkpointing)")
+        except Exception:
+            pass
 
     # Optional class weights can be computed here if needed
     criterion: nn.Module
@@ -223,7 +245,7 @@ def fit(cfg: TrainConfig):
     for epoch in range(1, cfg.epochs + 1):
         train_loss = train_one_epoch(
             model, train_loader, criterion, optimizer, cfg.device, scaler, cfg.mix_precision,
-            mixup_alpha=cfg.mixup, cutmix_alpha=cfg.cutmix,
+            mixup_alpha=cfg.mixup, cutmix_alpha=cfg.cutmix, grad_accum_steps=cfg.grad_accum_steps,
         )
         val_loss, val_acc, y_true, y_pred = evaluate(model, val_loader, criterion, cfg.device)
         scheduler.step()
@@ -305,6 +327,7 @@ if __name__ == "__main__":
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--patience", type=int, default=7, help="早停耐心轮数；<=0 表示关闭早停")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--backbone", type=str, default="resnet18")
@@ -327,6 +350,8 @@ if __name__ == "__main__":
     p.add_argument("--focal_gamma", type=float, default=2.0)
     p.add_argument("--mixup", type=float, default=0.0)
     p.add_argument("--cutmix", type=float, default=0.0)
+    p.add_argument("--grad_accum_steps", type=int, default=1, help="梯度累计步数，用于小显存")
+    p.add_argument("--grad_checkpointing", action="store_true", help="启用梯度检查点（timm 模型通常支持）")
     args = p.parse_args()
 
     cfg = TrainConfig(
@@ -335,6 +360,7 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         epochs=args.epochs,
+    patience=args.patience,
         lr=args.lr,
         weight_decay=args.weight_decay,
         backbone=args.backbone,
@@ -356,6 +382,8 @@ if __name__ == "__main__":
         focal_gamma=args.focal_gamma,
         mixup=args.mixup,
         cutmix=args.cutmix,
+        grad_accum_steps=args.grad_accum_steps,
+        grad_checkpointing=args.grad_checkpointing,
     )
 
     fit(cfg)

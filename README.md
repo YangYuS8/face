@@ -109,6 +109,8 @@ python -m src.fer.train \
 `--auto_augment`（启用 AutoAugment）、`--random_erasing 0.25`、
 损失相关：`--loss_type ce|focal`、`--label_smoothing 0.1`、`--focal_gamma 2.0`、
 混合增强：`--mixup 0.2`（CutMix 参数 `--cutmix` 暂未实现，将被忽略）。
+稳定性/小显存：
+`--patience 0`（关闭早停，或调大耐心）、`--grad_accum_steps 2`（梯度累计）、`--grad_checkpointing`（timm 模型支持时可显著省显存）。
 
 训练中会保存 `best.pt`（基于验证集准确率），以及 `history.json`。
 若使用 timm 模型，请先安装：`pip install timm`。
@@ -206,3 +208,26 @@ python -m src.fer.evaluate \
 - 如遇 `unzip: command not found`，请先安装 unzip（Ubuntu/Debian：`sudo apt-get install unzip`）。
 - 若下载缓慢或网络受限，可配置代理后再执行 Kaggle CLI。
 - 还有一个官方“CSV 原始版本”的 FER2013（Kaggle 竞赛页面），若使用 CSV，需要自行将像素解码成图片并整理为 `ImageFolder` 结构；本 README 脚本使用的是已整理好的“图片版”数据集。
+
+## 附：小显存（如 6GB）训练 ViT 的建议
+
+若出现 `CUDA out of memory`：
+
+1) 降低 `--batch_size`（如 64→32→16→8）。
+2) 启用 AMP（默认开启，除非 `--no_amp`），并打开梯度累计与检查点：
+
+```zsh
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+python -m src.fer.train \
+  --data_root data/fer2013 \
+  --pretrained \
+  --epochs 100 \
+  --backbone vit_base_patch16_224 \
+  --batch_size 16 \
+  --grad_accum_steps 2 \
+  --grad_checkpointing \
+  --auto_augment --random_erasing 0.25 --mixup 0.2
+```
+
+3) 必要时减小 `--img_size 224→192/160`，或选择更小模型（如 `vit_small_patch16_224` 或 `vit_tiny_patch16_224`、`convnext_nano`）。
+4) 关闭不必要的日志器/浏览器 GPU 加速，释放显存。
