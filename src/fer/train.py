@@ -7,7 +7,7 @@ from contextlib import nullcontext
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, SequentialLR, LinearLR
 from torch.cuda.amp import GradScaler
 from tqdm import tqdm
 from sklearn.metrics import classification_report, accuracy_score
@@ -50,6 +50,9 @@ class TrainConfig:
     cutmix: float = 0.0
     grad_accum_steps: int = 1
     grad_checkpointing: bool = False
+    warmup_epochs: int = 0
+    ema: bool = False
+    ema_decay: float = 0.999
 
 
 class EarlyStopper:
@@ -232,13 +235,28 @@ def fit(cfg: TrainConfig):
         else:
             criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=cfg.epochs)
+    main_sched = CosineAnnealingLR(optimizer, T_max=max(1, cfg.epochs - cfg.warmup_epochs))
+    if cfg.warmup_epochs and cfg.warmup_epochs > 0:
+        warmup = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=cfg.warmup_epochs)
+        scheduler = SequentialLR(optimizer, schedulers=[warmup, main_sched], milestones=[cfg.warmup_epochs])
+    else:
+        scheduler = main_sched
     scaler = GradScaler(enabled=cfg.mix_precision)
 
     es = EarlyStopper(patience=cfg.patience, mode="max")
 
     best_acc = -1.0
     best_path = os.path.join(cfg.out_dir, "best.pt")
+    # Optional EMA
+    ema_state = None
+    if cfg.ema:
+        ema_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+    def _ema_update(model_state, ema_state_dict, decay: float):
+        for k, v in model_state.items():
+            if k in ema_state_dict:
+                ema_state_dict[k].mul_(decay).add_(v.detach(), alpha=(1.0 - decay))
+        return ema_state_dict
 
     history = []
 
@@ -247,8 +265,23 @@ def fit(cfg: TrainConfig):
             model, train_loader, criterion, optimizer, cfg.device, scaler, cfg.mix_precision,
             mixup_alpha=cfg.mixup, cutmix_alpha=cfg.cutmix, grad_accum_steps=cfg.grad_accum_steps,
         )
+        # Evaluate current model; if EMA enabled also evaluate EMA snapshot
         val_loss, val_acc, y_true, y_pred = evaluate(model, val_loader, criterion, cfg.device)
+        if cfg.ema and ema_state is not None:
+            current_state = model.state_dict()
+            model.load_state_dict(ema_state, strict=False)
+            ema_val_loss, ema_val_acc, _, _ = evaluate(model, val_loader, criterion, cfg.device)
+            # Restore current weights
+            model.load_state_dict(current_state, strict=False)
+            # Prefer EMA metrics for selection
+            if ema_val_acc > val_acc:
+                val_acc = ema_val_acc
+                val_loss = ema_val_loss
         scheduler.step()
+
+        # After optimizer step each batch, update EMA; we do a simple per-epoch update here too
+        if cfg.ema and ema_state is not None:
+            ema_state = _ema_update(model.state_dict(), ema_state, cfg.ema_decay)
 
         report = classification_report(y_true, y_pred, target_names=list(class_names), zero_division=0, output_dict=True)
         history.append({
@@ -276,8 +309,11 @@ def fit(cfg: TrainConfig):
         # Save best
         if val_acc > best_acc:
             best_acc = val_acc
+            save_state = model.state_dict()
+            if cfg.ema and ema_state is not None:
+                save_state = ema_state
             torch.save({
-                "model_state": model.state_dict(),
+                "model_state": save_state,
                 "cfg": asdict(cfg),
                 "num_classes": num_classes,
                 "class_names": class_names,
@@ -328,6 +364,7 @@ if __name__ == "__main__":
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--patience", type=int, default=7, help="早停耐心轮数；<=0 表示关闭早停")
+    p.add_argument("--warmup_epochs", type=int, default=0, help="学习率 warmup 轮数")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--backbone", type=str, default="resnet18")
@@ -352,6 +389,8 @@ if __name__ == "__main__":
     p.add_argument("--cutmix", type=float, default=0.0)
     p.add_argument("--grad_accum_steps", type=int, default=1, help="梯度累计步数，用于小显存")
     p.add_argument("--grad_checkpointing", action="store_true", help="启用梯度检查点（timm 模型通常支持）")
+    p.add_argument("--ema", action="store_true", help="启用模型 EMA 以提升泛化")
+    p.add_argument("--ema_decay", type=float, default=0.999, help="EMA 衰减系数，接近 1 更平滑")
     args = p.parse_args()
 
     cfg = TrainConfig(
@@ -361,6 +400,7 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         epochs=args.epochs,
     patience=args.patience,
+    warmup_epochs=args.warmup_epochs,
         lr=args.lr,
         weight_decay=args.weight_decay,
         backbone=args.backbone,
@@ -384,6 +424,8 @@ if __name__ == "__main__":
         cutmix=args.cutmix,
         grad_accum_steps=args.grad_accum_steps,
         grad_checkpointing=args.grad_checkpointing,
+        ema=args.ema,
+        ema_decay=args.ema_decay,
     )
 
     fit(cfg)

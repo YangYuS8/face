@@ -111,6 +111,8 @@ python -m src.fer.train \
 混合增强：`--mixup 0.2`（CutMix 参数 `--cutmix` 暂未实现，将被忽略）。
 稳定性/小显存：
 `--patience 0`（关闭早停，或调大耐心）、`--grad_accum_steps 2`（梯度累计）、`--grad_checkpointing`（timm 模型支持时可显著省显存）。
+优化训练：
+`--warmup_epochs 5`（学习率线性 warmup 后走余弦）、`--ema --ema_decay 0.999`（模型滑动平均，验证/保存优先使用 EMA）。
 
 训练中会保存 `best.pt`（基于验证集准确率），以及 `history.json`。
 若使用 timm 模型，请先安装：`pip install timm`。
